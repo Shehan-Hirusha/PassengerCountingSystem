@@ -30,12 +30,57 @@ ESP8266WebServer server(80);
 // FSR Sensor Configuration
 const int fsrPins[3] = {A0, D1, D2}; // Analog pins connected to the 3 FSRs
 int fsrValues[3] = {0, 0, 0};        // Variables to store FSR values
-const int threshold = 50;            // Threshold to determine pressure applied
+const int threshold = 490;            // Threshold to determine pressure applied
 int computerVision = 0;              // Computer vision count
 int currentStep = 0;                 // Tracks the sequence of FSR triggers
 int passengerCount = 0;              // Total passenger count
 unsigned long lastStepTime = 0;      // Timestamp of the last step
-const unsigned long debounceDelay = 200; // Delay to avoid step interference
+const unsigned long debounceDelay = 600; // Delay to avoid step interference
+
+// Global variables
+unsigned long sequenceStartTime = 0;
+bool sequenceInProgress = false;
+
+
+// Sequence tracking for entry and exit
+struct SequenceTracker {
+    int currentStep;
+    unsigned long lastStepTime;
+    unsigned long sequenceStartTime;
+    bool sequenceInProgress;
+} entrySequence = {0, 0, 0, false}, exitSequence = {0, 0, 0, false};
+
+
+// // Sequence tracking for entry and exit
+// struct SequenceTracker {
+//     int currentStep;
+//     unsigned long lastStepTime;
+//     unsigned long sequenceStartTime;
+//     bool sequenceInProgress;
+
+
+// SequenceTracker  entrySequence = {0, 0, 0, false};
+// SequenceTracker  exitSequence = {0, 0, 0, false};
+
+const unsigned long SEQUENCE_TIMEOUT = 3000; // 3 seconds timeout for incomplete sequences
+
+
+const unsigned long incompleteStepTimeout = 2000; // 3 seconds
+const unsigned long stepHoldTimeout = 3000;       // Timeout for standing on a step
+
+
+
+unsigned long stepHoldStart[3] = {0, 0, 0};    // Track hold time for each step
+bool isHoldingStep[3] = {false, false, false}; // Flags to track if a step is being held
+
+
+bool waitingForStep1 = false;
+bool waitingForStep2 = false;
+bool waitingForStep3 = false;
+
+bool sequenceActive = false;
+
+unsigned long stepTimeoutStart = 0;
 
 // Location tracking variables
 String location = "Unknown";
@@ -408,67 +453,77 @@ void loop() {
   for (int i = 0; i < 3; i++) {
     fsrValues[i] = analogRead(fsrPins[i]);
   }
-
   unsigned long currentTime = millis();
 
- // Detect sequence for passenger entering (1 -> 2 -> 3)
-  if (fsrValues[0] > threshold && currentStep == 0 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(1, fsrValues[0]);
-    currentStep = 1;
-    lastStepTime = currentTime;
-  } else if (fsrValues[1] > threshold && currentStep == 1 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(2, fsrValues[1]);
-    currentStep = 2;
-    lastStepTime = currentTime;
-  } else if (fsrValues[2] > threshold && currentStep == 2 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(3, fsrValues[2]);
-    passengerCount++;
-    Serial.println("Passenger IN");
-    Serial.print("Current Passenger Count: ");
-    Serial.println(passengerCount);
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Passenger IN");
-    display.print("Passenger Count: ");
-    display.println(passengerCount);
-    display.display();
-    currentStep = 0;
-    lastStepTime = currentTime;
-  }
-
-  // Detect sequence for passenger exiting (3 -> 2 -> 1)
-  if (fsrValues[2] > threshold && currentStep == 0 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(3, fsrValues[2]);
-    currentStep = -1;
-    lastStepTime = currentTime;
-  } else if (fsrValues[1] > threshold && currentStep == -1 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(2, fsrValues[1]);
-    currentStep = -2;
-    lastStepTime = currentTime;
-  } else if (fsrValues[0] > threshold && currentStep == -2 && (currentTime - lastStepTime > debounceDelay)) {
-    logStep(1, fsrValues[0]);
-    if (passengerCount > 0) {
-      passengerCount--;
-      Serial.println("Passenger OUT");
-      Serial.print("Current Passenger Count: ");
-      Serial.println(passengerCount);
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("Passenger OUT");
-      display.print("Passenger Count: ");
-      display.println(passengerCount);
-      display.display();
-    } else {
-      Serial.println("Error: Cannot decrease passenger count below 0");
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("Error:");
-      display.println("Count below 0");
-      display.display();
+     // Handle entry sequence (1 -> 2 -> 3)
+    if (!entrySequence.sequenceInProgress) {
+        if (fsrValues[0] > threshold && (currentTime - entrySequence.lastStepTime > debounceDelay)) {
+            logStep(1, fsrValues[0]);
+            entrySequence.currentStep = 1;
+            entrySequence.lastStepTime = currentTime;
+            entrySequence.sequenceStartTime = currentTime;
+            entrySequence.sequenceInProgress = true;
+        }
+    } else if (entrySequence.currentStep == 1) {
+        if (fsrValues[1] > threshold && (currentTime - entrySequence.lastStepTime > debounceDelay)) {
+            logStep(2, fsrValues[1]);
+            entrySequence.currentStep = 2;
+            entrySequence.lastStepTime = currentTime;
+        }
+    } else if (entrySequence.currentStep == 2) {
+        if (fsrValues[2] > threshold && (currentTime - entrySequence.lastStepTime > debounceDelay)) {
+            logStep(3, fsrValues[2]);
+            passengerCount++;
+            Serial.println("Passenger IN - Count: " + String(passengerCount));
+            entrySequence.currentStep = 0;
+            entrySequence.lastStepTime = currentTime;
+            entrySequence.sequenceInProgress = false;
+        }
     }
-    currentStep = 0;
-    lastStepTime = currentTime;
-  }
+
+    // Handle exit sequence (3 -> 2 -> 1)
+    if (!exitSequence.sequenceInProgress) {
+        if (fsrValues[2] > threshold && (currentTime - exitSequence.lastStepTime > debounceDelay)) {
+            logStep(3, fsrValues[2]);
+            exitSequence.currentStep = 3;
+            exitSequence.lastStepTime = currentTime;
+            exitSequence.sequenceStartTime = currentTime;
+            exitSequence.sequenceInProgress = true;
+        }
+    } else if (exitSequence.currentStep == 3) {
+        if (fsrValues[1] > threshold && (currentTime - exitSequence.lastStepTime > debounceDelay)) {
+            logStep(2, fsrValues[1]);
+            exitSequence.currentStep = 4;
+            exitSequence.lastStepTime = currentTime;
+        }
+    } else if (exitSequence.currentStep == 4) {
+        if (fsrValues[0] > threshold && (currentTime - exitSequence.lastStepTime > debounceDelay)) {
+            logStep(1, fsrValues[0]);
+            if (passengerCount > 0) {
+                passengerCount--;
+            }
+            Serial.println("Passenger OUT - Count: " + String(passengerCount));
+            exitSequence.currentStep = 0;
+            exitSequence.lastStepTime = currentTime;
+            exitSequence.sequenceInProgress = false;
+        }
+    }
+
+    // Check for sequence timeouts
+    if (entrySequence.sequenceInProgress && 
+        (currentTime - entrySequence.sequenceStartTime > SEQUENCE_TIMEOUT)) {
+        Serial.println("Entry sequence timeout - resetting");
+        entrySequence.currentStep = 0;
+        entrySequence.sequenceInProgress = false;
+    }
+
+    if (exitSequence.sequenceInProgress && 
+        (currentTime - exitSequence.sequenceStartTime > SEQUENCE_TIMEOUT)) {
+        Serial.println("Exit sequence timeout - resetting");
+        exitSequence.currentStep = 0;
+        exitSequence.sequenceInProgress = false;
+    }
+
 
   // Serve web requests
   server.handleClient();
